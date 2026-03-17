@@ -13,36 +13,77 @@ if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir);
 }
 
-// PostgreSQL 连接池
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false } // Render 需要 SSL
-});
+// 全局变量存储数据库连接状态
+let pool = null;
+let dbConnected = false;
+
+// 初始化 PostgreSQL 连接池
+function initPool() {
+  if (!process.env.DATABASE_URL) {
+    console.error('❌ 错误: DATABASE_URL 环境变量未设置');
+    console.log('⚠️ 服务将以无数据库模式运行（仅健康检查可用）');
+    return null;
+  }
+
+  try {
+    const newPool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      connectionTimeoutMillis: 5000,
+      idleTimeoutMillis: 30000,
+      max: 10
+    });
+
+    newPool.on('error', (err) => {
+      console.error('❌ PostgreSQL 连接池错误:', err);
+      dbConnected = false;
+    });
+
+    return newPool;
+  } catch (err) {
+    console.error('❌ 创建数据库连接池失败:', err);
+    return null;
+  }
+}
 
 // 初始化数据库表
 async function initDB() {
-  const client = await pool.connect();
+  if (!pool) {
+    console.log('⚠️ 数据库未配置，跳过表初始化');
+    return;
+  }
+
   try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        email VARCHAR(255) UNIQUE NOT NULL,
-        api_key VARCHAR(100) UNIQUE NOT NULL,
-        balance INTEGER DEFAULT 1000, -- 美分，$10
-        status VARCHAR(20) DEFAULT 'active',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        source VARCHAR(100) DEFAULT 'formspark',
-        metadata JSONB DEFAULT '{}'
-      );
-    `);
-    console.log('✅ 数据库表初始化成功');
+    const client = await pool.connect();
+    try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS users (
+          id SERIAL PRIMARY KEY,
+          email VARCHAR(255) UNIQUE NOT NULL,
+          api_key VARCHAR(100) UNIQUE NOT NULL,
+          balance INTEGER DEFAULT 1000,
+          status VARCHAR(20) DEFAULT 'active',
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          source VARCHAR(100) DEFAULT 'formspark',
+          metadata JSONB DEFAULT '{}'
+        );
+      `);
+      console.log('✅ 数据库表初始化成功');
+      dbConnected = true;
+    } finally {
+      client.release();
+    }
   } catch (err) {
-    console.error('❌ 数据库初始化失败:', err);
-  } finally {
-    client.release();
+    console.error('❌ 数据库初始化失败:', err.message);
+    dbConnected = false;
   }
 }
-initDB();
+
+// 初始化数据库连接
+pool = initPool();
+if (pool) {
+  initDB();
+}
 
 // 中间件
 app.use(express.json());
@@ -53,16 +94,34 @@ function generateApiKey() {
   return 'tks_' + crypto.randomBytes(16).toString('hex');
 }
 
-// 记录新用户到本地文件（方便手动查看）
+// 记录新用户到本地文件
 function logNewUser(email, apiKey) {
   const logPath = path.join(dataDir, 'new_users_today.txt');
   const line = `${new Date().toISOString()} | ${email} | ${apiKey}\n`;
   fs.appendFileSync(logPath, line);
 }
 
+// 健康检查
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    time: new Date().toISOString(),
+    dbConnected: dbConnected,
+    port: PORT
+  });
+});
+
 // Webhook 接收端点
 app.post('/webhook/formspark', async (req, res) => {
   console.log('📩 收到 Webhook 请求');
+  
+  if (!dbConnected || !pool) {
+    return res.status(503).json({ 
+      error: 'Database not available',
+      message: '服务暂时无法处理请求，请稍后重试'
+    });
+  }
+
   try {
     const { email } = req.body;
     if (!email) {
@@ -95,8 +154,12 @@ app.post('/webhook/formspark', async (req, res) => {
   }
 });
 
-// 可选：查看用户列表（仅用于测试，生产应加认证）
+// 查看用户列表
 app.get('/api/users', async (req, res) => {
+  if (!dbConnected || !pool) {
+    return res.status(503).json({ error: 'Database not available' });
+  }
+
   try {
     const result = await pool.query('SELECT id, email, api_key, balance, created_at FROM users ORDER BY created_at DESC');
     res.json(result.rows);
@@ -105,11 +168,17 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// 健康检查
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date().toISOString() });
+// 根路径
+app.get('/', (req, res) => {
+  res.json({ 
+    message: 'TokenSales Webhook Server',
+    health: '/health',
+    webhook: '/webhook/formspark'
+  });
 });
 
+// 启动服务器
 app.listen(PORT, () => {
   console.log(`🚀 Webhook server running on port ${PORT}`);
+  console.log(`📊 数据库状态: ${dbConnected ? '已连接' : '未连接'}`);
 });
