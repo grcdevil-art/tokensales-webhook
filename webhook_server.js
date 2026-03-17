@@ -3,9 +3,16 @@ const { Pool } = require('pg');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const sgMail = require('@sendgrid/mail');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// SendGrid 配置
+if (process.env.SENDGRID_API_KEY) {
+  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+}
+const FROM_EMAIL = process.env.FROM_EMAIL || 'no-reply@tokensales.com';
 
 // 上游 API 配置
 const UPSTREAM_PROVIDER = process.env.UPSTREAM_PROVIDER || 'openrouter';
@@ -177,6 +184,109 @@ function logNewUser(email, apiKey) {
   fs.appendFileSync(logPath, line);
 }
 
+// 发送欢迎邮件
+async function sendWelcomeEmail(email, apiKey) {
+  if (!process.env.SENDGRID_API_KEY) {
+    console.log('⚠️ SENDGRID_API_KEY 未配置，跳过邮件发送');
+    return;
+  }
+
+  const msg = {
+    to: email,
+    from: FROM_EMAIL,
+    subject: '🎉 欢迎来到 TokenSales - 您的 API Key 已生成',
+    html: `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Welcome to TokenSales</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; }
+    .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
+    .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
+    .api-key { background: #1a1a2e; color: #00ff88; padding: 15px; border-radius: 5px; font-family: 'Courier New', monospace; font-size: 14px; word-break: break-all; margin: 20px 0; }
+    .button { display: inline-block; background: #667eea; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; margin: 10px 0; }
+    .footer { text-align: center; color: #666; font-size: 12px; margin-top: 30px; }
+    .highlight { color: #667eea; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>🚀 欢迎加入 TokenSales!</h1>
+    <p>您的 AI API 代理服务已就绪</p>
+  </div>
+  
+  <div class="content">
+    <h2>您好!</h2>
+    
+    <p>感谢您注册 <strong>TokenSales</strong>！我们致力于为您提供 <span class="highlight">价格更低、速度更快</span> 的 AI 模型 API 服务。</p>
+    
+    <h3>🎁 您的账户已激活</h3>
+    <ul>
+      <li>✅ 免费额度：<strong>$10</strong>（1000 美分）</li>
+      <li>✅ 支持模型：DeepSeek、Kimi、MiniMax、GLM-5 等</li>
+      <li>✅ 价格优势：比官方低 <strong>50-80%</strong></li>
+    </ul>
+    
+    <h3>🔑 您的 API Key</h3>
+    <div class="api-key">${apiKey}</div>
+    
+    <p><strong>重要提示：</strong>请妥善保管您的 API Key，不要分享给他人。</p>
+    
+    <h3>🚀 快速开始</h3>
+    <p>使用以下代码测试 API：</p>
+    <pre style="background: #f4f4f4; padding: 15px; border-radius: 5px; overflow-x: auto;">
+curl -X POST https://tokensales-webhook.onrender.com/v1/chat/completions \\
+  -H "Authorization: Bearer ${apiKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "deepseek/deepseek-chat",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'</pre>
+    
+    <a href="https://tokensales-webhook.onrender.com" class="button">查看 Dashboard</a>
+    
+    <h3>📚 文档与支持</h3>
+    <ul>
+      <li><a href="https://tokensales-webhook.onrender.com/v1/models">查看支持的模型列表</a></li>
+      <li><a href="https://tokensales-webhook.onrender.com/docs">API 文档</a></li>
+      <li>遇到问题？回复此邮件或联系 support@tokensales.com</li>
+    </ul>
+    
+    <p>祝您使用愉快！<br>TokenSales 团队</p>
+  </div>
+  
+  <div class="footer">
+    <p>此邮件由 TokenSales 自动发送</p>
+    <p>如您未注册，请忽略此邮件</p>
+  </div>
+</body>
+</html>
+    `,
+    text: `欢迎来到 TokenSales!
+
+您的 API Key: ${apiKey}
+
+免费额度: $10 (1000 美分)
+支持模型: DeepSeek、Kimi、MiniMax、GLM-5 等
+
+快速开始:
+curl -X POST https://tokensales-webhook.onrender.com/v1/chat/completions \\
+  -H "Authorization: Bearer ${apiKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model": "deepseek/deepseek-chat", "messages": [{"role": "user", "content": "Hello!"}]}'
+
+查看 Dashboard: https://tokensales-webhook.onrender.com
+
+TokenSales 团队
+`
+  };
+
+  await sgMail.send(msg);
+}
+
 app.post('/webhook/formspark', async (req, res) => {
   console.log('📩 收到 Webhook 请求');
   
@@ -207,6 +317,16 @@ app.post('/webhook/formspark', async (req, res) => {
 
     logNewUser(email, apiKey);
     console.log('✅ 新用户已保存:', email, apiKey);
+    
+    // 发送欢迎邮件
+    try {
+      await sendWelcomeEmail(email, apiKey);
+      console.log('✅ 欢迎邮件已发送:', email);
+    } catch (emailErr) {
+      console.error('⚠️ 邮件发送失败:', emailErr.message);
+      // 邮件发送失败不影响注册流程
+    }
+    
     res.status(200).json({ success: true, email, apiKey });
   } catch (err) {
     console.error('❌ Webhook 处理错误:', err);
