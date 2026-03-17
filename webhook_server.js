@@ -7,19 +7,62 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// SiliconFlow API 配置
-const SILICONFLOW_BASE_URL = 'https://api.siliconflow.cn/v1';
+// 上游 API 配置
+const UPSTREAM_PROVIDER = process.env.UPSTREAM_PROVIDER || 'openrouter';
+const UPSTREAM_BASE_URL = UPSTREAM_PROVIDER === 'openrouter' 
+  ? 'https://openrouter.ai/api/v1'
+  : 'https://api.siliconflow.cn/v1';
 
-// 模型定价配置（美分/百万token）
-// 注意：模型ID必须与 SiliconFlow 支持的格式完全匹配
+// OpenRouter 站点信息（必需）
+const HTTP_REFERER = process.env.HTTP_REFERER || 'https://tokensales.onrender.com';
+const X_TITLE = process.env.X_TITLE || 'TokenSales API';
+
+// 模型售价配置（美分/百万输出token）
 const MODEL_PRICING = {
-  'deepseek-ai/DeepSeek-V3': { input: 28, output: 42, name: 'DeepSeek V3' },
-  'deepseek-ai/DeepSeek-R1': { input: 50, output: 150, name: 'DeepSeek R1' },
-  'Pro/deepseek-ai/DeepSeek-V3': { input: 28, output: 42, name: 'DeepSeek V3 (Pro)' },
-  'Pro/deepseek-ai/DeepSeek-R1': { input: 50, output: 150, name: 'DeepSeek R1 (Pro)' },
-  'MiniMax/MiniMax-M2.5': { input: 30, output: 120, name: 'MiniMax M2.5' },
-  'moonshot/kimi-k2.5': { input: 60, output: 300, name: 'Kimi K2.5' },
-  'zhipai/glm-5': { input: 100, output: 320, name: 'GLM-5' }
+  // OpenRouter 模型映射
+  'deepseek/deepseek-chat': { 
+    input: 50, 
+    output: parseInt(process.env.DEEPSEEK_V3_PRICE) || 150, 
+    name: 'DeepSeek V3',
+    upstream_model: 'deepseek/deepseek-chat'
+  },
+  'deepseek/deepseek-r1': { 
+    input: 55, 
+    output: parseInt(process.env.DEEPSEEK_R1_PRICE) || 250, 
+    name: 'DeepSeek R1',
+    upstream_model: 'deepseek/deepseek-r1'
+  },
+  'minimax/minimax-m1': { 
+    input: 100, 
+    output: parseInt(process.env.MINIMAX_M2_5_PRICE) || 300, 
+    name: 'MiniMax M2.5',
+    upstream_model: 'minimax/minimax-m1'
+  },
+  'moonshotai/kimi-k2.5': { 
+    input: 150, 
+    output: parseInt(process.env.KIMI_K2_5_PRICE) || 450, 
+    name: 'Kimi K2.5',
+    upstream_model: 'moonshotai/kimi-k2.5'
+  },
+  'z-ai/glm-5': { 
+    input: 100, 
+    output: parseInt(process.env.GLM_5_PRICE) || 320, 
+    name: 'GLM-5',
+    upstream_model: 'z-ai/glm-5'
+  },
+  // SiliconFlow 备选映射
+  'deepseek-ai/DeepSeek-V3': { 
+    input: 28, 
+    output: 42, 
+    name: 'DeepSeek V3 (SF)',
+    upstream_model: 'deepseek-ai/DeepSeek-V3'
+  },
+  'deepseek-ai/DeepSeek-R1': { 
+    input: 55, 
+    output: 150, 
+    name: 'DeepSeek R1 (SF)',
+    upstream_model: 'deepseek-ai/DeepSeek-R1'
+  }
 };
 
 // 确保数据目录存在
@@ -71,6 +114,7 @@ async function initDB() {
   try {
     const client = await pool.connect();
     try {
+      // 创建 users 表
       await client.query(`
         CREATE TABLE IF NOT EXISTS users (
           id SERIAL PRIMARY KEY,
@@ -84,6 +128,7 @@ async function initDB() {
         );
       `);
       
+      // 创建 usage_log 表（增加 price 和 upstream 字段）
       await client.query(`
         CREATE TABLE IF NOT EXISTS usage_log (
           id SERIAL PRIMARY KEY,
@@ -91,8 +136,10 @@ async function initDB() {
           model VARCHAR(100) NOT NULL,
           input_tokens INTEGER DEFAULT 0,
           output_tokens INTEGER DEFAULT 0,
+          price INTEGER DEFAULT 0,
           cost INTEGER DEFAULT 0,
           status VARCHAR(50) DEFAULT 'success',
+          upstream VARCHAR(50) DEFAULT 'openrouter',
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
       `);
@@ -108,11 +155,13 @@ async function initDB() {
   }
 }
 
+// 初始化
 pool = initPool();
 if (pool) {
   initDB();
 }
 
+// 中间件
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -203,13 +252,13 @@ async function deductBalance(userId, cost) {
   }
 }
 
-async function logUsage(userId, model, inputTokens, outputTokens, cost, status) {
+async function logUsage(userId, model, inputTokens, outputTokens, price, cost, status, upstream) {
   if (!pool) return;
   try {
     await pool.query(
-      `INSERT INTO usage_log (user_id, model, input_tokens, output_tokens, cost, status, created_at) 
-       VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
-      [userId, model, inputTokens, outputTokens, cost, status]
+      `INSERT INTO usage_log (user_id, model, input_tokens, output_tokens, price, cost, status, upstream, created_at) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
+      [userId, model, inputTokens, outputTokens, price, cost, status, upstream]
     );
   } catch (err) {
     console.error('Failed to log usage:', err);
@@ -221,6 +270,7 @@ app.get('/health', (req, res) => {
     status: 'ok', 
     time: new Date().toISOString(),
     dbConnected: dbConnected,
+    upstream: UPSTREAM_PROVIDER,
     port: PORT
   });
 });
@@ -271,6 +321,7 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
+// 聊天补全代理 - 按售价扣费
 app.post('/v1/chat/completions', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -297,18 +348,27 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
   }
   
-  const inputText = messages.map(m => m.content).join('');
-  const estimatedInputTokens = Math.ceil(inputText.length / 4);
+  const pricing = MODEL_PRICING[model];
+  const upstreamModel = pricing.upstream_model;
   
   try {
-    const response = await fetch(`${SILICONFLOW_BASE_URL}/chat/completions`, {
+    // 构建请求头
+    const headers = {
+      'Authorization': `Bearer ${UPSTREAM_PROVIDER === 'openrouter' ? process.env.OPENROUTER_API_KEY : process.env.SILICONFLOW_API_KEY}`,
+      'Content-Type': 'application/json'
+    };
+    
+    // OpenRouter 需要额外的头
+    if (UPSTREAM_PROVIDER === 'openrouter') {
+      headers['HTTP-Referer'] = HTTP_REFERER;
+      headers['X-Title'] = X_TITLE;
+    }
+    
+    const response = await fetch(`${UPSTREAM_BASE_URL}/chat/completions`, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.SILICONFLOW_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
+      headers: headers,
       body: JSON.stringify({
-        model,
+        model: upstreamModel,
         messages,
         stream,
         max_tokens: 4096
@@ -317,12 +377,13 @@ app.post('/v1/chat/completions', async (req, res) => {
     
     if (!response.ok) {
       const error = await response.text();
-      await logUsage(user.id, model, estimatedInputTokens, 0, 0, 'upstream_error');
+      await logUsage(user.id, model, 0, 0, pricing.output, 0, 'upstream_error', UPSTREAM_PROVIDER);
       return res.status(response.status).json({
         error: { message: 'Upstream API error', details: error }
       });
     }
     
+    // 处理流式响应
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -353,30 +414,28 @@ app.post('/v1/chat/completions', async (req, res) => {
       
       res.end();
       
+      // 按售价计算费用（基于 output_tokens）
       const outputTokens = Math.ceil(outputText.length / 4);
-      const pricing = MODEL_PRICING[model];
-      const cost = Math.ceil(
-        (estimatedInputTokens * pricing.input + outputTokens * pricing.output) / 1000000
-      );
+      const cost = Math.ceil((outputTokens * pricing.output) / 1000000);
       
       await deductBalance(user.id, cost);
-      await logUsage(user.id, model, estimatedInputTokens, outputTokens, cost, 'success');
+      await logUsage(user.id, model, 0, outputTokens, pricing.output, cost, 'success', UPSTREAM_PROVIDER);
       
     } else {
+      // 非流式响应
       const data = await response.json();
       
       const outputTokens = data.usage?.completion_tokens || Math.ceil(
         (data.choices?.[0]?.message?.content || '').length / 4
       );
-      const inputTokens = data.usage?.prompt_tokens || estimatedInputTokens;
+      const inputTokens = data.usage?.prompt_tokens || 0;
       
-      const pricing = MODEL_PRICING[model];
-      const cost = Math.ceil(
-        (inputTokens * pricing.input + outputTokens * pricing.output) / 1000000
-      );
+      // 按售价计算费用（基于 output_tokens）
+      const cost = Math.ceil((outputTokens * pricing.output) / 1000000);
       
+      // 检查余额是否足够
       if (user.balance < cost) {
-        await logUsage(user.id, model, inputTokens, outputTokens, 0, 'insufficient_balance');
+        await logUsage(user.id, model, inputTokens, outputTokens, pricing.output, 0, 'insufficient_balance', UPSTREAM_PROVIDER);
         return res.status(402).json({
           error: { 
             message: `Insufficient balance. Required: ${cost} cents, Available: ${user.balance} cents`,
@@ -385,9 +444,11 @@ app.post('/v1/chat/completions', async (req, res) => {
         });
       }
       
+      // 扣款并记录
       await deductBalance(user.id, cost);
-      await logUsage(user.id, model, inputTokens, outputTokens, cost, 'success');
+      await logUsage(user.id, model, inputTokens, outputTokens, pricing.output, cost, 'success', UPSTREAM_PROVIDER);
       
+      // 添加余额信息到响应
       data.balance_remaining = user.balance - cost;
       
       res.json(data);
@@ -395,7 +456,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     
   } catch (err) {
     console.error('Proxy error:', err);
-    await logUsage(user.id, model, estimatedInputTokens, 0, 0, 'error');
+    await logUsage(user.id, model, 0, 0, pricing.output, 0, 'error', UPSTREAM_PROVIDER);
     res.status(500).json({
       error: { message: 'Internal server error', type: 'server_error' }
     });
@@ -405,7 +466,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     message: 'TokenSales API Server',
-    version: '2.0.0',
+    version: '2.1.0',
+    upstream: UPSTREAM_PROVIDER,
     endpoints: {
       health: '/health',
       webhook: '/webhook/formspark',
@@ -420,5 +482,6 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 TokenSales Server running on port ${PORT}`);
   console.log(`📊 数据库状态: ${dbConnected ? '已连接' : '未连接'}`);
+  console.log(`🔗 上游提供商: ${UPSTREAM_PROVIDER}`);
   console.log(`🤖 支持的模型: ${Object.keys(MODEL_PRICING).length}`);
 });
